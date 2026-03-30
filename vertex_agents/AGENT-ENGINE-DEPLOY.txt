@@ -39,3 +39,21 @@ Local stack check
 -----------------
 After running .\scripts\start-all.ps1:
   .\scripts\check-local-stack.ps1
+
+Next.js UI → Vertex Agent Engine (every chat invokes the engine)
+---------------------------------------------------------------
+The browser cannot call reasoningEngines:query with your user credentials. Use the
+FastAPI orchestrator as a proxy:
+
+1. Deploy cost_metrics_agent then pa_orchestrator_agent (order above).
+2. gcloud auth application-default login  (same account that can invoke the engine)
+3. Export GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, and EITHER:
+     ORCHESTRATOR_AGENT_ENGINE_RESOURCE=projects/.../reasoningEngines/ID
+   OR the console "Copy query URL" value as:
+     ORCHESTRATOR_AGENT_ENGINE_QUERY_URL=https://...reasoningEngines/ID:query
+4. pip install -r agents/orchestrator/requirements.txt (includes google-cloud-aiplatform)
+5. Run uvicorn on agents/orchestrator/main.py :8000
+6. Keep frontend NEXT_PUBLIC_ORCHESTRATOR_URL=http://127.0.0.1:8000
+
+GET /health shows agent_engine_chat_enabled: true when project + resource are set.
+Agent Engine metrics in the console should increment when you send messages.

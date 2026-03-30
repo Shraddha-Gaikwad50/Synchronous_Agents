@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+import agent_engine_chat
+
 from intelligence import (
     DEFAULT_OUT_OF_SCOPE_REPLY,
     ENABLE_VERTEX_ROUTING,
@@ -239,6 +241,10 @@ async def health():
         "specialist_card_loaded": SPECIALIST_CARD is not None,
         "specialist_name": (SPECIALIST_CARD or {}).get("name"),
         "vertex_routing_enabled": ENABLE_VERTEX_ROUTING,
+        "agent_engine_chat_enabled": agent_engine_chat.is_agent_engine_chat_enabled(),
+        "orchestrator_engine_resource_set": bool(
+            agent_engine_chat.resolved_engine_resource()
+        ),
     }
 
 
@@ -361,8 +367,15 @@ async def chat_stream(body: ChatMessage):
 
     session_id = body.session_id or str(uuid.uuid4())
 
+    if agent_engine_chat.is_agent_engine_chat_enabled():
+        stream = agent_engine_chat.stream_chat_via_agent_engine(
+            body.message, session_id
+        )
+    else:
+        stream = chat_orchestrated_loop(body, session_id)
+
     return StreamingResponse(
-        chat_orchestrated_loop(body, session_id),
+        stream,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
