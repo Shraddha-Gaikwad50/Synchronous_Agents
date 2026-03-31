@@ -7,7 +7,7 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import { Bot, Loader2, Send, Sparkles, User } from "lucide-react";
+import { Bot, Loader2, Mic, Send, Sparkles, Square, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -25,11 +25,39 @@ const ORCHESTRATOR_URL =
 
 const SESSION_STORAGE_KEY = "pa-orchestrator-session";
 
+/** Speech-to-Text v2 sync Recognize: keep clips under ~1 minute. */
+const MAX_RECORDING_MS = 55_000;
+
+function pickRecorderMimeType(): string | undefined {
+  const types = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+  ];
+  for (const t of types) {
+    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(t)) {
+      return t;
+    }
+  }
+  return undefined;
+}
+
+function extensionForMime(mime: string): string {
+  if (mime.includes("webm")) return "webm";
+  if (mime.includes("mp4")) return "mp4";
+  if (mime.includes("ogg")) return "ogg";
+  return "webm";
+}
+
 const SUGGESTIONS = [
   "What were our top cloud costs last week?",
   "Compare prod vs dev spend by service",
   "Show BigQuery-related costs for this month",
 ];
+
+function friendlyApiError(message: string): string {
+  return message.replace(/^\d+\s+[A-Z_]+:\s*/i, "").trim() || message;
+}
 
 function extractA2AText(payload: Record<string, unknown>): string {
   const status = payload.status as Record<string, unknown> | undefined;
@@ -64,8 +92,16 @@ export function ChatPanel() {
   const [loading, setLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [health, setHealth] = useState<HealthState>("checking");
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordChunksRef = useRef<BlobPart[]>([]);
+  const recordMimeRef = useRef<string>("audio/webm");
+  const recordLimitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     try {
@@ -97,6 +133,151 @@ export function ChatPanel() {
       clearInterval(id);
     };
   }, []);
+
+  const stopMediaTracks = useCallback(() => {
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaStreamRef.current = null;
+  }, []);
+
+  const clearRecordLimitTimer = useCallback(() => {
+    if (recordLimitTimerRef.current) {
+      clearTimeout(recordLimitTimerRef.current);
+      recordLimitTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearRecordLimitTimer();
+      mediaRecorderRef.current?.stop();
+      stopMediaTracks();
+    };
+  }, [clearRecordLimitTimer, stopMediaTracks]);
+
+  const transcribeBlob = useCallback(async (blob: Blob, filename: string) => {
+    setIsTranscribing(true);
+    setVoiceError(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", blob, filename);
+      const res = await fetch("/api/transcribe", {
+        method: "POST",
+        body: fd,
+      });
+      const data = (await res.json()) as { text?: string; error?: string };
+      if (!res.ok) {
+        setVoiceError(
+          friendlyApiError(data.error || `Transcription failed (${res.status})`)
+        );
+        return;
+      }
+      const text = (data.text ?? "").trim();
+      if (!text) {
+        setVoiceError("No speech detected. Try again.");
+        return;
+      }
+      setInput((prev) => {
+        const p = prev.trim();
+        return p ? `${p} ${text}` : text;
+      });
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    } catch (e) {
+      setVoiceError(
+        e instanceof Error ? e.message : "Could not reach transcription service."
+      );
+    } finally {
+      setIsTranscribing(false);
+    }
+  }, []);
+
+  const stopRecording = useCallback(() => {
+    clearRecordLimitTimer();
+    const rec = mediaRecorderRef.current;
+    if (!rec || rec.state === "inactive") {
+      setIsRecording(false);
+      return;
+    }
+    try {
+      if (rec.state === "recording" && "requestData" in rec) {
+        (rec as MediaRecorder).requestData();
+      }
+    } catch {
+      /* ignore */
+    }
+    rec.stop();
+  }, [clearRecordLimitTimer]);
+
+  const startRecording = useCallback(async () => {
+    if (loading || isTranscribing || isRecording) return;
+    setVoiceError(null);
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setVoiceError("Microphone is not available in this browser.");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      const mimeType = pickRecorderMimeType();
+      recordMimeRef.current = mimeType ?? "audio/webm";
+      const rec = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+      recordChunksRef.current = [];
+      rec.ondataavailable = (ev) => {
+        if (ev.data.size > 0) recordChunksRef.current.push(ev.data);
+      };
+      rec.onerror = () => {
+        setVoiceError("Recording error.");
+        setIsRecording(false);
+        stopMediaTracks();
+        mediaRecorderRef.current = null;
+        clearRecordLimitTimer();
+      };
+      rec.onstop = () => {
+        stopMediaTracks();
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
+        const chunks = recordChunksRef.current;
+        recordChunksRef.current = [];
+        const mime = recordMimeRef.current || rec.mimeType || "audio/webm";
+        const blob = new Blob(chunks, { type: mime });
+        if (blob.size < 256) {
+          setVoiceError("Recording too short.");
+          return;
+        }
+        const ext = extensionForMime(mime);
+        void transcribeBlob(blob, `recording.${ext}`);
+      };
+      mediaRecorderRef.current = rec;
+      rec.start(250);
+      setIsRecording(true);
+      recordLimitTimerRef.current = setTimeout(() => {
+        stopRecording();
+      }, MAX_RECORDING_MS);
+    } catch (e) {
+      const name = e instanceof DOMException ? e.name : "";
+      if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+        setVoiceError("Microphone permission denied.");
+      } else {
+        setVoiceError(
+          e instanceof Error ? e.message : "Could not start microphone."
+        );
+      }
+    }
+  }, [
+    loading,
+    isTranscribing,
+    isRecording,
+    stopMediaTracks,
+    clearRecordLimitTimer,
+    transcribeBlob,
+    stopRecording,
+  ]);
+
+  const toggleVoice = useCallback(() => {
+    if (isRecording) stopRecording();
+    else void startRecording();
+  }, [isRecording, stopRecording, startRecording]);
 
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -230,36 +411,38 @@ export function ChatPanel() {
   };
 
   return (
-    <div className="flex flex-col gap-5">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+    <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+        <span className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
           Try asking
         </span>
-        {SUGGESTIONS.map((s) => (
-          <button
-            key={s}
-            type="button"
-            disabled={loading}
-            onClick={() => void sendMessage(s)}
-            className={cn(
-              "rounded-full border border-border/80 bg-background/80 px-3 py-1 text-left text-xs text-foreground shadow-sm",
-              "transition hover:border-primary/40 hover:bg-muted/60",
-              "disabled:pointer-events-none disabled:opacity-50"
-            )}
-          >
-            {s}
-          </button>
-        ))}
+        <div className="flex flex-wrap gap-2">
+          {SUGGESTIONS.map((s) => (
+            <button
+              key={s}
+              type="button"
+              disabled={loading}
+              onClick={() => void sendMessage(s)}
+              className={cn(
+                "rounded-full border border-primary/20 bg-primary/[0.06] px-3.5 py-1.5 text-left text-xs font-medium text-foreground",
+                "shadow-sm transition hover:border-primary/35 hover:bg-primary/[0.11] hover:shadow",
+                "disabled:pointer-events-none disabled:opacity-50"
+              )}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div className="relative flex min-h-[min(520px,70vh)] flex-col overflow-hidden rounded-2xl border border-border/60 bg-gradient-to-b from-card to-muted/20 shadow-lg shadow-black/5">
-        <div className="flex items-center justify-between border-b border-border/60 bg-muted/30 px-4 py-3">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+      <div className="relative flex min-h-[min(520px,70vh)] flex-col overflow-hidden rounded-2xl border border-border/70 bg-card shadow-xl shadow-primary/5 ring-1 ring-black/[0.04] dark:ring-white/[0.06]">
+        <div className="flex items-center justify-between border-b border-border/70 bg-gradient-to-r from-muted/50 via-muted/30 to-transparent px-4 py-3.5">
+          <div className="flex items-center gap-3 text-sm font-medium">
+            <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary/12 text-primary shadow-inner ring-1 ring-primary/10">
               <Sparkles className="h-4 w-4" />
             </span>
             <div>
-              <p className="leading-tight">Orchestrator</p>
+              <p className="leading-tight text-foreground">Orchestrator</p>
               <p className="text-xs font-normal text-muted-foreground">
                 Routes cost questions to the specialist agent
               </p>
@@ -292,11 +475,11 @@ export function ChatPanel() {
           </div>
         </div>
 
-        <ScrollArea className="flex-1 p-4">
+        <ScrollArea className="flex-1 bg-gradient-to-b from-background/40 to-muted/10 p-4">
           <div className="flex flex-col gap-4 pr-3">
             {messages.length === 0 && (
-              <div className="mx-auto max-w-md rounded-xl border border-dashed border-border/80 bg-muted/20 px-5 py-8 text-center">
-                <p className="text-sm font-medium text-foreground">
+              <div className="mx-auto max-w-md rounded-2xl border border-dashed border-primary/25 bg-primary/[0.04] px-6 py-9 text-center">
+                <p className="text-sm font-semibold text-foreground">
                   Cloud cost &amp; usage only
                 </p>
                 <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
@@ -332,8 +515,8 @@ export function ChatPanel() {
                   className={cn(
                     "max-w-[min(100%,42rem)] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-sm",
                     m.role === "user"
-                      ? "bg-primary text-primary-foreground"
-                      : "border border-border/80 bg-card text-foreground"
+                      ? "bg-gradient-to-br from-primary to-primary/90 text-primary-foreground shadow-primary/20"
+                      : "border border-border/70 bg-card text-foreground shadow-sm"
                   )}
                 >
                   <p className="whitespace-pre-wrap break-words">
@@ -355,45 +538,82 @@ export function ChatPanel() {
         </ScrollArea>
 
         <form
-          className="border-t border-border/60 bg-card/90 p-3 backdrop-blur"
+          className="border-t border-border/70 bg-muted/20 p-3 backdrop-blur-md sm:p-4"
           onSubmit={(e) => {
             e.preventDefault();
             void sendMessage();
           }}
         >
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
             <textarea
               ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               placeholder="Ask about cloud spend, services, environments, trends…"
-              disabled={loading}
+              disabled={loading || isTranscribing}
               rows={2}
               autoComplete="off"
               className={cn(
-                "min-h-[44px] flex-1 resize-y rounded-xl border border-input bg-background px-3 py-2.5 text-sm",
-                "shadow-inner outline-none ring-offset-background placeholder:text-muted-foreground",
-                "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                "min-h-[48px] flex-1 resize-y rounded-xl border border-input/90 bg-background px-3.5 py-3 text-sm",
+                "shadow-sm outline-none ring-offset-background placeholder:text-muted-foreground",
+                "focus-visible:border-primary/40 focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:ring-offset-2",
                 "disabled:cursor-not-allowed disabled:opacity-50"
               )}
             />
-            <Button
-              type="submit"
-              disabled={loading || !input.trim()}
-              className="h-11 shrink-0 gap-2 rounded-xl px-5 sm:h-[44px]"
-            >
-              {loading ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Send className="h-4 w-4" />
-              )}
-              Send
-            </Button>
+            <div className="flex shrink-0 items-center justify-end gap-2 sm:h-[48px] sm:justify-start">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                disabled={loading || isTranscribing}
+                onClick={() => toggleVoice()}
+                className={cn(
+                  "h-11 w-11 shrink-0 rounded-xl border-input/90 shadow-sm",
+                  isRecording &&
+                    "animate-pulse border-destructive/60 bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive"
+                )}
+                aria-pressed={isRecording}
+                aria-label={isRecording ? "Stop recording" : "Voice input"}
+                title={
+                  isRecording
+                    ? "Stop and transcribe"
+                    : "Voice input (Google Speech-to-Text)"
+                }
+              >
+                {isTranscribing ? (
+                  <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
+                ) : isRecording ? (
+                  <Square className="h-5 w-5 fill-current" aria-hidden />
+                ) : (
+                  <Mic className="h-5 w-5" aria-hidden />
+                )}
+              </Button>
+              <Button
+                type="submit"
+                disabled={loading || !input.trim() || isTranscribing}
+                className="h-11 shrink-0 gap-2 rounded-xl px-6 font-semibold shadow-sm sm:h-[44px]"
+              >
+                {loading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Send className="h-4 w-4" />
+                )}
+                Send
+              </Button>
+            </div>
           </div>
-          <p className="mt-2 text-center text-[11px] text-muted-foreground">
-            Enter to send · Shift+Enter for newline · Orchestrator SSE → cost
-            agent
+          {voiceError && (
+            <div
+              className="mt-3 rounded-lg border border-destructive/25 bg-destructive/[0.06] px-3 py-2.5 text-center text-sm text-destructive"
+              role="alert"
+            >
+              {friendlyApiError(voiceError)}
+            </div>
+          )}
+          <p className="mt-3 text-center text-[11px] leading-snug text-muted-foreground">
+            Enter to send · Shift+Enter for newline · Mic → Google Speech-to-Text
+            · Orchestrator SSE → cost agent
           </p>
         </form>
       </div>

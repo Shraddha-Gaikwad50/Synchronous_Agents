@@ -28,6 +28,9 @@ yarn-error.log*
 # local env files
 .env*.local
 
+# GCP keys (e.g. Speech-to-Text service account); never commit
+.secrets/
+
 # vercel
 .vercel
 
