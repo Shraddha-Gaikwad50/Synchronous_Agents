@@ -29,6 +29,16 @@ $feDir = Join-Path $RepoRoot "frontend"
 
 $env:DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/postgres"
 
+# BigQuery billing export for cost agent (override via config\gcp.env manually or merge)
+if (-not $env:GOOGLE_CLOUD_PROJECT) { $env:GOOGLE_CLOUD_PROJECT = "gls-training-486405" }
+if (-not $env:BQ_BILLING_PROJECT) { $env:BQ_BILLING_PROJECT = $env:GOOGLE_CLOUD_PROJECT }
+if (-not $env:BQ_BILLING_DATASET) { $env:BQ_BILLING_DATASET = "gcp_billing_data" }
+if (-not $env:BQ_BILLING_TABLE) { $env:BQ_BILLING_TABLE = "gcp_billing_export_resource_v1_01B40E_943432_338729" }
+$saKey = Join-Path $RepoRoot "frontend\.secrets\speech-sa.json"
+if (-not $env:GOOGLE_APPLICATION_CREDENTIALS -and (Test-Path $saKey)) {
+    $env:GOOGLE_APPLICATION_CREDENTIALS = $saKey
+}
+
 Write-Host ">>> Starting cost-agent :8001 (logs\cost-agent.log)..."
 Start-Process -FilePath "python" -ArgumentList @(
     "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8001"

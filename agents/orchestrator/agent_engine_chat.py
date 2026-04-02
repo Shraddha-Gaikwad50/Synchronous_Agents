@@ -53,6 +53,15 @@ def resolved_engine_resource() -> str:
 
 
 def is_agent_engine_chat_enabled() -> bool:
+    # Local dev: UI should hit FastAPI /chat/stream → cost agent on :8001 (BigQuery).
+    # Set ORCHESTRATOR_LOCAL_CHAT=1 when ORCHESTRATOR_AGENT_ENGINE_RESOURCE is set but
+    # your user/SA lacks reasoningEngines.get/query (otherwise the stream crashes → browser "Network error").
+    if os.environ.get("ORCHESTRATOR_LOCAL_CHAT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
     return bool(resolved_engine_resource() and _PROJECT)
 
 

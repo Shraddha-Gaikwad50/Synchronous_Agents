@@ -4,6 +4,9 @@ logs/*.err.log
 config/gcp.env
 vertex_agents/**/.env
 
+# Local scratch scripts (do not commit)
+tmp_*.py
+
 __pycache__/
 *.py[cod]
 *.pyc

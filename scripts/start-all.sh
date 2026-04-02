@@ -46,6 +46,14 @@ export DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:54
 export COST_AGENT_CARD_URL="${COST_AGENT_CARD_URL:-http://127.0.0.1:8001/.well-known/agent.json}"
 export COST_AGENT_TASKS_URL="${COST_AGENT_TASKS_URL:-http://127.0.0.1:8001/tasks/send}"
 
+# BigQuery Cloud Billing export (cost agent). Override in config/gcp.env.
+export BQ_BILLING_PROJECT="${BQ_BILLING_PROJECT:-${GOOGLE_CLOUD_PROJECT:-}}"
+export BQ_BILLING_DATASET="${BQ_BILLING_DATASET:-gcp_billing_data}"
+export BQ_BILLING_TABLE="${BQ_BILLING_TABLE:-gcp_billing_export_resource_v1_01B40E_943432_338729}"
+if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "$ROOT/frontend/.secrets/speech-sa.json" ]]; then
+  export GOOGLE_APPLICATION_CREDENTIALS="$ROOT/frontend/.secrets/speech-sa.json"
+fi
+
 echo ">>> Starting cost-agent :8001..."
 (cd "$ROOT/agents/cost_agent" && nohup "$PYTHON_BIN" -m uvicorn main:app --host 127.0.0.1 --port 8001 \
   >"$ROOT/logs/cost-agent.log" 2>"$ROOT/logs/cost-agent.err.log" &)
