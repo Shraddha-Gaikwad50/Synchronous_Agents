@@ -2,8 +2,8 @@
 Cost Metrics Specialist — HTTP surface compatible with A2A-style discovery and /tasks/send SSE.
 
 Data source modes:
-- BigQuery billing export (preferred when configured)
-- PostgreSQL cloud_costs table (fallback)
+- BigQuery billing export (preferred): LLM-generated SQL (set BILLING_AGENT_LLM_SQL=0 for parameterized queries only).
+- PostgreSQL cloud_costs table (fallback when BigQuery is unavailable in auto mode).
 """
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ from telemetry import setup_observability
 from billing_llm_sql import (
     google_ai_configured,
     llm_sql_usable,
-    question_needs_llm_sql,
     run_llm_billing_query,
     vertex_available,
 )
@@ -128,6 +127,40 @@ def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date |
         notes.append(f"yesterday ({y})")
         return y, y, notes
 
+    _mo = (
+        r"january|february|march|april|may|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+    )
+    # Day-first: "1st April 2026", "1 April 2026", "1st of april 2026" (before month+year = whole month).
+    m_dom = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({_mo})\s+(\d{{4}})\b", q_lower)
+    if m_dom:
+        dom = int(m_dom.group(1))
+        month = _MONTH_NAMES[m_dom.group(2)]
+        year = int(m_dom.group(3))
+        if 1 <= dom <= 31:
+            try:
+                d_only = date(year, month, dom)
+                notes.append(f"filtering date={d_only}")
+                return d_only, d_only, notes
+            except ValueError:
+                pass
+    # Month day year: "April 1 2026", "April 1st, 2026"
+    m_mdy = re.search(
+        rf"\b({_mo})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b",
+        q_lower,
+    )
+    if m_mdy:
+        month = _MONTH_NAMES[m_mdy.group(1)]
+        dom = int(m_mdy.group(2))
+        year = int(m_mdy.group(3))
+        if 1 <= dom <= 31:
+            try:
+                d_only = date(year, month, dom)
+                notes.append(f"filtering date={d_only}")
+                return d_only, d_only, notes
+            except ValueError:
+                pass
+
     m = re.search(
         r"(?:for\s+)?(?:the\s+)?(?:entire\s+month\s+of\s+)?"
         r"(january|february|march|april|may|june|july|august|september|october|november|december|"
@@ -178,6 +211,7 @@ def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date |
 class CostQueryFilters:
     env: str | None
     svc: str | None
+    billing_project_id: str | None
     billing_region: str | None
     period_start: date | None
     period_end: date | None
@@ -249,6 +283,13 @@ def _extract_gcp_project_id(question: str) -> str | None:
     )
     if m_slug:
         return _normalize_project_id_slug(m_slug.group(1))
+    # "for jaybel-dev on …" / "cost in gls-training-486405 …" (hyphenated billing project.id)
+    m_for = re.search(
+        r"(?i)\b(?:for|in)\s+([a-z][a-z0-9]*(?:\s*-\s*[a-z0-9]+)+)\b",
+        ql,
+    )
+    if m_for:
+        return _normalize_project_id_slug(m_for.group(1))
     patterns = (
         r"(?i)in\s+the\s+([a-z][a-z0-9-]{1,62})\s+project\b",
         r"(?i)\bproject\s+([a-z][a-z0-9-]{1,62})\b",
@@ -259,194 +300,6 @@ def _extract_gcp_project_id(question: str) -> str | None:
         if m:
             return _normalize_project_id_slug(m.group(1))
     return None
-
-
-def _sku_rank_template_eligible(question: str, f: CostQueryFilters) -> bool:
-    return bool(
-        re.search(r"\bskus?\b", question, re.I)
-        and _extract_gcp_project_id(question)
-        and f.has_period
-    )
-
-
-def _try_sku_top_by_project_json(
-    question: str,
-    f: CostQueryFilters,
-    table_ref: str,
-    table_project: str,
-) -> str | None:
-    """Fast template: top N SKUs by cost for one project.id over parsed date range (no env label filter)."""
-    if not re.search(r"\bskus?\b", question, re.I):
-        return None
-    pid = _extract_gcp_project_id(question)
-    if not pid or not f.has_period or f.period_start is None or f.period_end is None:
-        return None
-    m = re.search(r"\btop\s+(\d+)\b", question, re.I)
-    top_n = int(m.group(1)) if m else 5
-    top_n = min(max(top_n, 1), 40)
-
-    sql = f"""
-    SELECT
-      sku.description AS sku_description,
-      ANY_VALUE(service.description) AS service_name,
-      ANY_VALUE(project.id) AS project_id,
-      SUM(cost) AS cost_inr
-    FROM `{table_ref}`
-    WHERE DATE(usage_start_time) BETWEEN @period_start AND @period_end
-      AND project.id = @project_id
-    GROUP BY sku.description
-    ORDER BY cost_inr DESC
-    LIMIT @top_limit
-    """
-    params = [
-        bigquery.ScalarQueryParameter("period_start", "DATE", f.period_start.isoformat()),
-        bigquery.ScalarQueryParameter("period_end", "DATE", f.period_end.isoformat()),
-        bigquery.ScalarQueryParameter("project_id", "STRING", pid),
-        bigquery.ScalarQueryParameter("top_limit", "INT64", top_n),
-    ]
-    client = bigquery.Client(project=table_project)
-    rows = list(
-        client.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(query_parameters=params),
-        ).result()
-    )
-    out: list[dict[str, str]] = []
-    for row in rows:
-        out.append(
-            {
-                "sku_description": str(row["sku_description"] or ""),
-                "service_name": str(row["service_name"] or ""),
-                "project_id": str(row["project_id"] or ""),
-                "cost_inr": str(row["cost_inr"]),
-                "currency": "INR",
-            }
-        )
-    return json.dumps(out, indent=2)
-
-
-def _spend_by_project_template_eligible(question: str, f: CostQueryFilters) -> bool:
-    if not f.has_period:
-        return False
-    ql = question.lower()
-    if not (
-        re.search(r"\b(breakdown|broken down)\b", ql)
-        or re.search(r"\bby\s+gcp\s+project\b", ql)
-        or re.search(r"\b(per|each)\s+project\b", ql)
-        or re.search(r"\bby\s+project\b", ql)
-    ):
-        return False
-    return bool(
-        re.search(r"\b(spend|cost|billing|charged|amount|total|inr|money)\b", ql)
-    )
-
-
-def _try_spend_by_project_json(
-    question: str,
-    f: CostQueryFilters,
-    table_ref: str,
-    table_project: str,
-) -> str | None:
-    """Aggregate cost by billing project.id over the parsed window (no env label filter)."""
-    if not _spend_by_project_template_eligible(question, f):
-        return None
-    if not f.has_period or f.period_start is None or f.period_end is None:
-        return None
-    sql = f"""
-    SELECT
-      project.id AS project_id,
-      SUM(cost) AS cost_inr
-    FROM `{table_ref}`
-    WHERE DATE(usage_start_time) BETWEEN @period_start AND @period_end
-    GROUP BY project.id
-    ORDER BY cost_inr DESC
-    LIMIT 100
-    """
-    params = [
-        bigquery.ScalarQueryParameter("period_start", "DATE", f.period_start.isoformat()),
-        bigquery.ScalarQueryParameter("period_end", "DATE", f.period_end.isoformat()),
-    ]
-    client = bigquery.Client(project=table_project)
-    rows = list(
-        client.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(query_parameters=params),
-        ).result()
-    )
-    out: list[dict[str, str]] = []
-    for row in rows:
-        out.append(
-            {
-                "project_id": str(row["project_id"] or ""),
-                "cost_inr": str(row["cost_inr"]),
-                "currency": "INR",
-            }
-        )
-    return json.dumps(out, indent=2)
-
-
-def _regions_cost_template_eligible(question: str, f: CostQueryFilters) -> bool:
-    """Cost grouped by location.region (no LLM)."""
-    if not f.has_period:
-        return False
-    ql = question.lower()
-    if not re.search(
-        r"\b(regions|availability\s+zones?|data\s+centers?|geographic)\b",
-        ql,
-    ):
-        return False
-    return bool(
-        re.search(
-            r"\b(cost|spend|money|expensive|most|highest|paid|bill|price)\b",
-            ql,
-        )
-    )
-
-
-def _try_regions_cost_json(
-    question: str,
-    f: CostQueryFilters,
-    table_ref: str,
-    table_project: str,
-) -> str | None:
-    if not _regions_cost_template_eligible(question, f):
-        return None
-    if not f.has_period or f.period_start is None or f.period_end is None:
-        return None
-    sql = f"""
-    SELECT
-      COALESCE(
-        NULLIF(TRIM(COALESCE(location.region, '')), ''),
-        '(unset / global)'
-      ) AS region,
-      SUM(cost) AS cost_inr
-    FROM `{table_ref}`
-    WHERE DATE(usage_start_time) BETWEEN @period_start AND @period_end
-    GROUP BY region
-    ORDER BY cost_inr DESC
-    LIMIT 30
-    """
-    params = [
-        bigquery.ScalarQueryParameter("period_start", "DATE", f.period_start.isoformat()),
-        bigquery.ScalarQueryParameter("period_end", "DATE", f.period_end.isoformat()),
-    ]
-    client = bigquery.Client(project=table_project)
-    rows = list(
-        client.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(query_parameters=params),
-        ).result()
-    )
-    out: list[dict[str, str]] = []
-    for row in rows:
-        out.append(
-            {
-                "region": str(row["region"] or ""),
-                "cost_inr": str(row["cost_inr"]),
-                "currency": "INR",
-            }
-        )
-    return json.dumps(out, indent=2)
 
 
 def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFilters:
@@ -484,6 +337,10 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     if br:
         notes.append(f"filtering location.region={br}")
 
+    bproj = _extract_gcp_project_id(question)
+    if bproj:
+        notes.append(f"filtering project.id={bproj}")
+
     breakdown = bool(
         re.search(
             r"\b(breakdown|broken down|by\s+gcp\s+project|by\s+project|per\s+project|each\s+project)\b",
@@ -503,6 +360,7 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     return CostQueryFilters(
         env=env,
         svc=svc,
+        billing_project_id=bproj,
         billing_region=br,
         period_start=ps,
         period_end=pe,
@@ -510,28 +368,6 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
         wants_top=wants_top,
         hint=hint,
     )
-
-
-def _skip_billing_llm_sql(question: str, f: CostQueryFilters) -> bool:
-    """Answer with parameterized BigQuery (query_bigquery) — no generated SQL / Vertex predict."""
-    if not f.has_period or f.period_start is None or f.period_end is None:
-        return False
-    ql = question.lower()
-    if any(
-        re.search(p, ql)
-        for p in (
-            r"\bcredits?\b",
-            r"\bpromotional\b",
-            r"\bpromo\b",
-            r"\bcommitment\b",
-            r"\breservation\b",
-            r"\bsustained use\b",
-        )
-    ):
-        return False
-    if re.search(r"\bskus?\b", ql) and not _extract_gcp_project_id(question):
-        return False
-    return bool(f.svc or f.billing_region or f.env)
 
 
 def compute_llm_date_window(f: CostQueryFilters, today: date) -> tuple[date, date, str]:
@@ -659,15 +495,6 @@ def query_bigquery(question: str) -> str:
     if not table_project:
         raise RuntimeError("Set BQ_BILLING_PROJECT or GOOGLE_CLOUD_PROJECT for BigQuery queries.")
     table_ref = f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
-    sku_early = _try_sku_top_by_project_json(question, f, table_ref, table_project)
-    if sku_early is not None:
-        return sku_early
-    spend_early = _try_spend_by_project_json(question, f, table_ref, table_project)
-    if spend_early is not None:
-        return spend_early
-    regions_early = _try_regions_cost_json(question, f, table_ref, table_project)
-    if regions_early is not None:
-        return regions_early
 
     filters: list[str] = []
     params: list[bigquery.ScalarQueryParameter] = []
@@ -682,6 +509,11 @@ def query_bigquery(question: str) -> str:
         )
         params.append(
             bigquery.ScalarQueryParameter("billing_region", "STRING", f.billing_region)
+        )
+    if f.billing_project_id:
+        filters.append("project.id = @billing_project_id")
+        params.append(
+            bigquery.ScalarQueryParameter("billing_project_id", "STRING", f.billing_project_id)
         )
     if f.has_period:
         filters.append("DATE(usage_start_time) BETWEEN @period_start AND @period_end")
@@ -775,58 +607,52 @@ def query_cost_data(question: str) -> tuple[str, str]:
     hint = f.hint
     table_project = BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     llm_on = os.environ.get("BILLING_AGENT_LLM_SQL", "1").lower() not in ("0", "false", "no")
+    table_ref = (
+        f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
+        if table_project and _bigquery_ready()
+        else ""
+    )
 
     if mode in {"auto", "bigquery"} and _bigquery_ready() and table_project:
-        table_ref = f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
-        sku_fast = _try_sku_top_by_project_json(question, f, table_ref, table_project)
-        if sku_fast is not None:
-            return (
-                sku_fast,
-                f"{hint}; source=bigquery; template=sku_by_project; currency=INR",
-            )
-        spend_fast = _try_spend_by_project_json(question, f, table_ref, table_project)
-        if spend_fast is not None:
-            return (
-                spend_fast,
-                f"{hint}; source=bigquery; template=spend_by_project; currency=INR",
-            )
-        regions_fast = _try_regions_cost_json(question, f, table_ref, table_project)
-        if regions_fast is not None:
-            return (
-                regions_fast,
-                f"{hint}; source=bigquery; template=cost_by_region; currency=INR",
-            )
-
-    if (
-        mode in {"auto", "bigquery"}
-        and _bigquery_ready()
-        and table_project
-        and llm_on
-        and question_needs_llm_sql(question)
-        and not _skip_billing_llm_sql(question, f)
-    ):
-        table_ref = f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
-        ws, we, wnote = compute_llm_date_window(f, date.today())
+        if llm_on:
+            if not llm_sql_usable():
+                err = json.dumps(
+                    {
+                        "error": "llm_sql_unavailable",
+                        "detail": "Install Vertex AI / Google AI dependencies and configure ADC or GOOGLE_AI_API_KEY.",
+                    },
+                    indent=2,
+                )
+                return err, f"{hint}; source=bigquery; currency=INR"
+            ws, we, wnote = compute_llm_date_window(f, date.today())
+            extra = hint if hint and hint != "no explicit filters" else ""
+            wnote_full = f"{wnote} Parser hints: {extra}".strip() if extra else wnote
+            try:
+                body, sh = run_llm_billing_query(
+                    question,
+                    table_ref,
+                    table_project,
+                    ws,
+                    we,
+                    wnote_full,
+                )
+                return body, f"{hint}; {sh}; source=bigquery; currency=INR"
+            except Exception as e:
+                err = json.dumps(
+                    {"error": "llm_sql_failed", "detail": str(e)},
+                    indent=2,
+                )
+                return err, f"{hint}; llm-sql failed; source=bigquery; currency=INR"
         try:
-            body, sh = run_llm_billing_query(
-                question,
-                table_ref,
-                table_project,
-                ws,
-                we,
-                wnote,
+            return (
+                query_bigquery(question),
+                f"{hint}; source=bigquery; BILLING_AGENT_LLM_SQL=0; currency=INR",
             )
-            return body, f"{hint}; {sh}; currency=INR"
-        except Exception as e:
-            hint = f"{hint}; llm-sql failed ({e}); fallback=template"
-
-    if mode in {"auto", "bigquery"} and _bigquery_ready():
-        try:
-            return query_bigquery(question), f"{hint}; source=bigquery; currency=INR"
         except Exception as e:
             if mode == "bigquery":
                 raise
             hint = f"{hint}; bigquery unavailable ({e}); fallback=postgres"
+
     sql, _ = nl_to_sql(question)
     params = _params_for_sql(sql, question)
     return run_query(sql, params), f"{hint}; source=postgres"
@@ -835,7 +661,7 @@ def query_cost_data(question: str) -> tuple[str, str]:
 def agent_card() -> dict:
     return {
         "name": "Cost Metrics Agent",
-        "description": "GCP billing export analytics (INR): fast templates plus guarded Vertex SQL for SKU, project, credits, regions.",
+        "description": "GCP billing export analytics (INR): guarded Vertex / Google AI generated BigQuery SQL. Set BILLING_AGENT_LLM_SQL=0 for legacy parameterized BigQuery only.",
         "url": BASE_URL,
         "version": "1.0.0",
         "capabilities": {"streaming": True, "pushNotifications": False},
@@ -860,7 +686,7 @@ app = FastAPI(title="Cost Metrics Agent", version="1.0.0")
 
 if _ADK_AVAILABLE:
     _cost_adk_agent = Agent(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         name="cost_metrics_adk",
         description="ADK agent placeholder; HTTP layer performs NL→SQL for Phase 1.",
     )
@@ -880,13 +706,10 @@ async def task_stream(message: str, task_id: str) -> AsyncIterator[str]:
     f = parse_cost_query(message)
     progress_hint = f.hint
     llm_on = os.environ.get("BILLING_AGENT_LLM_SQL", "1").lower() not in ("0", "false", "no")
-    use_llm = (
-        llm_on
-        and question_needs_llm_sql(message)
-        and not _skip_billing_llm_sql(message, f)
-        and not _sku_rank_template_eligible(message, f)
-        and not _spend_by_project_template_eligible(message, f)
-        and not _regions_cost_template_eligible(message, f)
+    table_project = BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    bq_ok = _bigquery_ready() and bool(table_project)
+    use_llm_bq = (
+        llm_on and bq_ok and SOURCE_MODE in {"auto", "bigquery"}
     )
     yield sse_pack(
         {
@@ -902,14 +725,10 @@ async def task_stream(message: str, task_id: str) -> AsyncIterator[str]:
     )
     await asyncio.sleep(0.05)
 
-    if _sku_rank_template_eligible(message, f):
-        run_msg = "Running fast template (top SKUs by project and date range)…"
-    elif _spend_by_project_template_eligible(message, f):
-        run_msg = "Running fast template (spend by GCP project for date range)…"
-    elif _regions_cost_template_eligible(message, f):
-        run_msg = "Running fast template (cost by GCP region for date range)…"
-    elif use_llm:
-        run_msg = "Running guarded analytics (Vertex / Google AI → BigQuery, dry-run byte cap)…"
+    if use_llm_bq:
+        run_msg = (
+            "Running Vertex / Google AI → BigQuery (LLM-generated SQL, dry-run byte cap)…"
+        )
     else:
         run_msg = f"Running query ({progress_hint})…"
     yield sse_pack(

@@ -79,6 +79,36 @@ def _dev_mention_is_project_slug(q: str) -> bool:
     return bool(re.search(r"[a-z0-9][a-z0-9-]*\s*-\s*dev\s+project", q, re.I))
 
 
+def _normalize_project_id_slug(raw: str) -> str:
+    return re.sub(r"\s+", "", raw.strip().lower())
+
+
+def _extract_gcp_project_id(question: str) -> str | None:
+    ql = question.strip()
+    m_slug = re.search(
+        r"(?i)\b([a-z][a-z0-9]*(?:\s*-\s*[a-z0-9]+)+)\s+project\b",
+        ql,
+    )
+    if m_slug:
+        return _normalize_project_id_slug(m_slug.group(1))
+    m_for = re.search(
+        r"(?i)\b(?:for|in)\s+([a-z][a-z0-9]*(?:\s*-\s*[a-z0-9]+)+)\b",
+        ql,
+    )
+    if m_for:
+        return _normalize_project_id_slug(m_for.group(1))
+    patterns = (
+        r"(?i)in\s+the\s+([a-z][a-z0-9-]{1,62})\s+project\b",
+        r"(?i)\bproject\s+([a-z][a-z0-9-]{1,62})\b",
+        r"(?i)\b([a-z][a-z0-9-]{1,62})\s+project\b",
+    )
+    for p in patterns:
+        m = re.search(p, ql)
+        if m:
+            return _normalize_project_id_slug(m.group(1))
+    return None
+
+
 def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date | None, date | None, list[str]]:
     notes: list[str] = []
 
@@ -97,6 +127,38 @@ def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date |
         y = today - timedelta(days=1)
         notes.append(f"yesterday ({y})")
         return y, y, notes
+
+    _mo = (
+        r"january|february|march|april|may|june|july|august|september|october|november|december|"
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+    )
+    m_dom = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({_mo})\s+(\d{{4}})\b", q_lower)
+    if m_dom:
+        dom = int(m_dom.group(1))
+        month = _MONTH_NAMES[m_dom.group(2)]
+        year = int(m_dom.group(3))
+        if 1 <= dom <= 31:
+            try:
+                d_only = date(year, month, dom)
+                notes.append(f"filtering date={d_only}")
+                return d_only, d_only, notes
+            except ValueError:
+                pass
+    m_mdy = re.search(
+        rf"\b({_mo})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b",
+        q_lower,
+    )
+    if m_mdy:
+        month = _MONTH_NAMES[m_mdy.group(1)]
+        dom = int(m_mdy.group(2))
+        year = int(m_mdy.group(3))
+        if 1 <= dom <= 31:
+            try:
+                d_only = date(year, month, dom)
+                notes.append(f"filtering date={d_only}")
+                return d_only, d_only, notes
+            except ValueError:
+                pass
 
     m = re.search(
         r"(?:for\s+)?(?:the\s+)?(?:entire\s+month\s+of\s+)?"
@@ -177,6 +239,7 @@ def _extract_billing_region(question: str) -> str | None:
 class CostQueryFilters:
     env: str | None
     svc: str | None
+    billing_project_id: str | None
     billing_region: str | None
     period_start: date | None
     period_end: date | None
@@ -223,6 +286,10 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     if br:
         notes.append(f"filtering location.region={br}")
 
+    bproj = _extract_gcp_project_id(question)
+    if bproj:
+        notes.append(f"filtering project.id={bproj}")
+
     breakdown = bool(
         re.search(
             r"\b(breakdown|broken down|by\s+gcp\s+project|by\s+project|per\s+project|each\s+project)\b",
@@ -242,6 +309,7 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     return CostQueryFilters(
         env=env,
         svc=svc,
+        billing_project_id=bproj,
         billing_region=br,
         period_start=ps,
         period_end=pe,
@@ -364,6 +432,11 @@ def _query_bigquery(question: str) -> str:
         )
         params.append(
             bigquery.ScalarQueryParameter("billing_region", "STRING", f.billing_region)
+        )
+    if f.billing_project_id:
+        filters.append("project.id = @billing_project_id")
+        params.append(
+            bigquery.ScalarQueryParameter("billing_project_id", "STRING", f.billing_project_id)
         )
     if f.has_period:
         filters.append("DATE(usage_start_time) BETWEEN @period_start AND @period_end")

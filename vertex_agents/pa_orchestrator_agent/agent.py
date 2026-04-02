@@ -138,7 +138,7 @@ def query_cost_specialist(question: str) -> str:
 
 root_agent = LlmAgent(
     name="pa_orchestrator",
-    model="gemini-2.0-flash",
+    model="gemini-2.5-flash",
     instruction=_ORCHESTRATOR_INSTRUCTION,
     tools=[FunctionTool(query_cost_specialist)],
 )

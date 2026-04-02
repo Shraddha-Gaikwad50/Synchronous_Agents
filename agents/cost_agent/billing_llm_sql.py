@@ -1,5 +1,5 @@
 """
-Guarded LLM-generated BigQuery SQL for billing analytics (hybrid fallback path).
+Guarded LLM-generated BigQuery SQL for billing analytics.
 
 Backends (see BILLING_LLM_PROVIDER):
 - Vertex AI (ADC): needs roles/aiplatform.user (predict on Gemini).
@@ -39,50 +39,6 @@ _FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|CALL|EXECUTE)\b",
     re.I,
 )
-
-
-def question_needs_llm_sql(question: str) -> bool:
-    ql = question.lower().strip()
-    if len(ql) < 10:
-        return False
-    patterns = (
-        r"\bskus?\b",
-        r"\bcredits?\b",
-        r"\bpromo",
-        r"\begress\b",
-        # Plural only — singular "region" appears in "asia-south1 region" (handled by templates).
-        r"\bregions\b",
-        r"\bper project\b",
-        r"\bby project\b",
-        r"\beach project\b",
-        r"\bbreakdown by project\b",
-        r"\bacross projects\b",
-        r"\bwhich projects\b",
-        r"\bwhat projects\b",
-        r"\bnetwork\b",
-        r"\bbilling account\b",
-        r"\badjustment\b",
-        r"\bdiscount\b",
-        r"\bcommitment\b",
-        r"\bcost type\b",
-        r"\binvoice\b",
-        r"\breservation\b",
-    )
-    if any(re.search(p, ql) for p in patterns):
-        return True
-    if ql.count(" by ") >= 2:
-        return True
-    if re.search(r"\b(which|what|how much|list|show all|compare)\b", ql) and re.search(
-        r"\b(project|sku|credit|regions|egress|network)\b", ql
-    ):
-        return True
-    if re.search(r"\b(breakdown|broken down)\b", ql):
-        return True
-    if re.search(r"\bspend\b", ql) and re.search(
-        r"\b(project|projects|sku|skus|credit|credits|regions|egress)\b", ql
-    ):
-        return True
-    return False
 
 
 def vertex_available() -> bool:
@@ -153,13 +109,11 @@ def _invoke_vertex(prompt: str) -> str:
         raise RuntimeError("google-cloud-aiplatform / vertexai not installed.")
     project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("BQ_BILLING_PROJECT", "")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-    # Stable default; do not inherit VERTEX_MODEL_ID. Map 2.5 → 2.0 unless explicitly allowed.
-    model_id = (os.environ.get("BILLING_LLM_MODEL") or "gemini-2.0-flash").strip() or "gemini-2.0-flash"
-    if (
-        "2.5-flash" in model_id.lower()
-        and os.environ.get("BILLING_LLM_ALLOW_25", "").strip().lower() not in ("1", "true", "yes")
-    ):
-        model_id = "gemini-2.0-flash"
+    model_id = (
+        os.environ.get("BILLING_LLM_MODEL")
+        or os.environ.get("VERTEX_MODEL_ID")
+        or "gemini-2.5-flash"
+    ).strip() or "gemini-2.5-flash"
     if not project:
         raise RuntimeError("GOOGLE_CLOUD_PROJECT (or BQ_BILLING_PROJECT) must be set for Vertex.")
     vertexai.init(project=project, location=location)
@@ -180,7 +134,7 @@ def _invoke_google_ai(prompt: str) -> str:
     key = google_ai_api_key()
     if not key:
         raise RuntimeError("Set GOOGLE_AI_API_KEY or GEMINI_API_KEY for Google AI fallback.")
-    mid = os.environ.get("BILLING_LLM_GOOGLE_AI_MODEL", "gemini-2.0-flash")
+    mid = os.environ.get("BILLING_LLM_GOOGLE_AI_MODEL", "gemini-2.5-flash")
     genai.configure(api_key=key)
     model = genai.GenerativeModel(mid)
     r = model.generate_content(

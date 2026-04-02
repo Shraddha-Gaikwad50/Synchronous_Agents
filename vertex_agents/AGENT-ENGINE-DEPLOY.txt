@@ -3,7 +3,7 @@ Vertex AI Agent Engine - two-agent layout (Google ADK)
 
 Project: gls-training-486405
 Region:  us-central1
-Model:   gemini-2.0-flash
+Model:   gemini-2.5-flash
 
 Folders (pass these paths to adk deploy agent_engine):
   vertex_agents/cost_metrics_agent

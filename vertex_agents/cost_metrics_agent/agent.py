@@ -19,7 +19,7 @@ def query_cloud_costs(question: str) -> str:
 
 root_agent = LlmAgent(
     name="cost_metrics_agent",
-    model="gemini-2.0-flash",
+    model="gemini-2.5-flash",
     instruction=(
         "You are a cloud cost analyst. Use query_cloud_costs for all cost questions. "
         "The tool may fetch from BigQuery Billing Export (preferred) or PostgreSQL "
