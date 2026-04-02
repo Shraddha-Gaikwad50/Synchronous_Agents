@@ -3,6 +3,8 @@ logs/*.err.log
 .venv/
 config/gcp.env
 vertex_agents/**/.env
+# Local Next.js env (use frontend/.env.example); may contain credential paths
+frontend/.env
 
 # Local scratch scripts (do not commit)
 tmp_*.py

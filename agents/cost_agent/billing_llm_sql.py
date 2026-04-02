@@ -1,13 +1,16 @@
 """
 Guarded LLM-generated BigQuery SQL for billing analytics (hybrid fallback path).
 
-Requires: google-cloud-aiplatform (Vertex), ADC or SA credentials, BigQuery IAM.
+Backends (see BILLING_LLM_PROVIDER):
+- Vertex AI (ADC): needs roles/aiplatform.user (predict on Gemini).
+- Google AI API: set GOOGLE_AI_API_KEY or GEMINI_API_KEY (no Vertex IAM).
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import warnings
 from datetime import date
 
 from google.cloud import bigquery
@@ -19,6 +22,15 @@ try:
     _VERTEX_OK = True
 except Exception:  # pragma: no cover
     _VERTEX_OK = False
+
+try:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        import google.generativeai as genai
+
+    _GENAI_OK = True
+except Exception:  # pragma: no cover
+    _GENAI_OK = False
 
 MAX_BYTES_DEFAULT = 1_000_000_000
 MAX_RESULT_ROWS = 512
@@ -38,7 +50,8 @@ def question_needs_llm_sql(question: str) -> bool:
         r"\bcredits?\b",
         r"\bpromo",
         r"\begress\b",
-        r"\bregions?\b",
+        # Plural only — singular "region" appears in "asia-south1 region" (handled by templates).
+        r"\bregions\b",
         r"\bper project\b",
         r"\bby project\b",
         r"\beach project\b",
@@ -60,13 +73,13 @@ def question_needs_llm_sql(question: str) -> bool:
     if ql.count(" by ") >= 2:
         return True
     if re.search(r"\b(which|what|how much|list|show all|compare)\b", ql) and re.search(
-        r"\b(project|sku|credit|region|egress|network)\b", ql
+        r"\b(project|sku|credit|regions|egress|network)\b", ql
     ):
         return True
     if re.search(r"\b(breakdown|broken down)\b", ql):
         return True
     if re.search(r"\bspend\b", ql) and re.search(
-        r"\b(project|projects|sku|skus|credit|credits|region|regions|egress)\b", ql
+        r"\b(project|projects|sku|skus|credit|credits|regions|egress)\b", ql
     ):
         return True
     return False
@@ -74,6 +87,147 @@ def question_needs_llm_sql(question: str) -> bool:
 
 def vertex_available() -> bool:
     return _VERTEX_OK
+
+
+def google_ai_api_key() -> str | None:
+    return (os.environ.get("GOOGLE_AI_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip() or None
+
+
+def google_ai_configured() -> bool:
+    return _GENAI_OK and bool(google_ai_api_key())
+
+
+def llm_sql_usable() -> bool:
+    """Import-level readiness (Vertex SDK and/or API key present). Runtime IAM may still deny Vertex."""
+    return _VERTEX_OK or google_ai_configured()
+
+
+def _is_vertex_permission_error(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return "403" in s or "permission_denied" in s or "iam_permission_denied" in s.replace(" ", "_")
+
+
+def _build_sql_prompt(
+    table_ref: str,
+    window_start: date,
+    window_end: date,
+    window_note: str,
+    question: str,
+) -> str:
+    ws, we = window_start.isoformat(), window_end.isoformat()
+    schema = f"""
+Allowed table (only source): `{table_ref}`
+
+Standard resource-level export (nested fields):
+- usage_start_time TIMESTAMP — required in WHERE as DATE(usage_start_time) BETWEEN ...
+- cost FLOAT64, currency STRING (this dataset uses **INR**)
+- service.id, service.description
+- sku.id, sku.description
+- project.id, project.name, project.labels (ARRAY)
+- location.region, location.zone, location.country
+- cost_type STRING
+- credits ARRAY<STRUCT<...>> — UNNEST(credits) for credit lines (amount, name, etc.)
+"""
+    return f"""You are a BigQuery analyst for GCP billing exports.
+
+{schema}
+
+Hard requirements:
+1. A single statement only: WITH ... SELECT ... or plain SELECT. No DDL/DML, no multi-statement.
+2. FROM / JOIN must only reference `{table_ref}` (UNNEST of its columns is allowed).
+3. WHERE must include exactly this predicate (you may AND more conditions after it):
+   DATE(usage_start_time) BETWEEN DATE('{ws}') AND DATE('{we}')
+4. Use explicit DATE('YYYY-MM-DD') literals for those bounds (do not use parameters).
+5. Prefer aggregates; for wide scans add LIMIT {MAX_RESULT_ROWS} or less.
+6. Amounts: SUM(cost); alias totals as total_inr or similar. Mention INR in column names where helpful.
+
+Window context: {window_note}
+
+User question:
+{question}
+"""
+
+
+def _invoke_vertex(prompt: str) -> str:
+    if not _VERTEX_OK:
+        raise RuntimeError("google-cloud-aiplatform / vertexai not installed.")
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("BQ_BILLING_PROJECT", "")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    # Stable default; do not inherit VERTEX_MODEL_ID. Map 2.5 → 2.0 unless explicitly allowed.
+    model_id = (os.environ.get("BILLING_LLM_MODEL") or "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+    if (
+        "2.5-flash" in model_id.lower()
+        and os.environ.get("BILLING_LLM_ALLOW_25", "").strip().lower() not in ("1", "true", "yes")
+    ):
+        model_id = "gemini-2.0-flash"
+    if not project:
+        raise RuntimeError("GOOGLE_CLOUD_PROJECT (or BQ_BILLING_PROJECT) must be set for Vertex.")
+    vertexai.init(project=project, location=location)
+    model = GenerativeModel(model_id)
+    r = model.generate_content(
+        prompt,
+        generation_config=GenerationConfig(temperature=0.1, max_output_tokens=4096),
+    )
+    text = (r.text or "").strip()
+    if not text:
+        raise RuntimeError("Vertex model returned empty text.")
+    return text
+
+
+def _invoke_google_ai(prompt: str) -> str:
+    if not _GENAI_OK:
+        raise RuntimeError("google-generativeai is not installed.")
+    key = google_ai_api_key()
+    if not key:
+        raise RuntimeError("Set GOOGLE_AI_API_KEY or GEMINI_API_KEY for Google AI fallback.")
+    mid = os.environ.get("BILLING_LLM_GOOGLE_AI_MODEL", "gemini-2.0-flash")
+    genai.configure(api_key=key)
+    model = genai.GenerativeModel(mid)
+    r = model.generate_content(
+        prompt,
+        generation_config={"temperature": 0.1, "max_output_tokens": 4096},
+    )
+    text = (getattr(r, "text", None) or "").strip()
+    if not text and r.candidates:
+        # Some responses only have parts
+        parts = r.candidates[0].content.parts
+        text = "".join(getattr(p, "text", "") for p in parts).strip()
+    if not text:
+        raise RuntimeError("Google AI model returned empty text.")
+    return text
+
+
+def _generate_raw_llm_text(question: str, table_ref: str, window_start: date, window_end: date, window_note: str) -> str:
+    prompt = _build_sql_prompt(table_ref, window_start, window_end, window_note, question)
+    provider = os.environ.get("BILLING_LLM_PROVIDER", "auto").strip().lower()
+    key = google_ai_api_key()
+
+    if provider == "google_ai":
+        return _invoke_google_ai(prompt)
+    if provider == "vertex":
+        return _invoke_vertex(prompt)
+
+    # auto: Vertex first, then Google AI on permission errors
+    v_err: BaseException | None = None
+    if _VERTEX_OK:
+        try:
+            return _invoke_vertex(prompt)
+        except Exception as e:  # noqa: BLE001
+            v_err = e
+            if not _is_vertex_permission_error(e) or not key:
+                raise
+    if key and _GENAI_OK:
+        return _invoke_google_ai(prompt)
+    if v_err:
+        raise RuntimeError(
+            "Vertex AI denied access (aiplatform.endpoints.predict). "
+            "Grant your user roles/aiplatform.user on the project, or set GOOGLE_AI_API_KEY / GEMINI_API_KEY "
+            "for Google AI Studio fallback."
+        ) from v_err
+    raise RuntimeError(
+        "No LLM backend available: install google-cloud-aiplatform for Vertex, "
+        "or set GOOGLE_AI_API_KEY with google-generativeai installed."
+    )
 
 
 def _strip_sql_comments(sql: str) -> str:
@@ -135,58 +289,12 @@ def generate_sql(
     window_end: date,
     window_note: str,
 ) -> str:
-    if not _VERTEX_OK:
+    if not llm_sql_usable():
         raise RuntimeError(
-            "vertexai is not available. Install google-cloud-aiplatform in the cost-agent environment."
+            "No LLM SQL backend: install google-cloud-aiplatform and/or google-generativeai "
+            "and set GOOGLE_AI_API_KEY if not using Vertex."
         )
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("BQ_BILLING_PROJECT", "")
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-    model_id = os.environ.get("BILLING_LLM_MODEL", os.environ.get("VERTEX_MODEL_ID", "gemini-2.0-flash"))
-    if not project:
-        raise RuntimeError("GOOGLE_CLOUD_PROJECT (or BQ_BILLING_PROJECT) must be set for Vertex.")
-
-    vertexai.init(project=project, location=location)
-    model = GenerativeModel(model_id)
-
-    ws, we = window_start.isoformat(), window_end.isoformat()
-    schema = f"""
-Allowed table (only source): `{table_ref}`
-
-Standard resource-level export (nested fields):
-- usage_start_time TIMESTAMP — required in WHERE as DATE(usage_start_time) BETWEEN ...
-- cost FLOAT64, currency STRING (this dataset uses **INR**)
-- service.id, service.description
-- sku.id, sku.description
-- project.id, project.name, project.labels (ARRAY)
-- location.region, location.zone, location.country
-- cost_type STRING
-- credits ARRAY<STRUCT<...>> — UNNEST(credits) for credit lines (amount, name, etc.)
-"""
-    prompt = f"""You are a BigQuery analyst for GCP billing exports.
-
-{schema}
-
-Hard requirements:
-1. A single statement only: WITH ... SELECT ... or plain SELECT. No DDL/DML, no multi-statement.
-2. FROM / JOIN must only reference `{table_ref}` (UNNEST of its columns is allowed).
-3. WHERE must include exactly this predicate (you may AND more conditions after it):
-   DATE(usage_start_time) BETWEEN DATE('{ws}') AND DATE('{we}')
-4. Use explicit DATE('YYYY-MM-DD') literals for those bounds (do not use parameters).
-5. Prefer aggregates; for wide scans add LIMIT {MAX_RESULT_ROWS} or less.
-6. Amounts: SUM(cost); alias totals as total_inr or similar. Mention INR in column names where helpful.
-
-Window context: {window_note}
-
-User question:
-{question}
-"""
-    r = model.generate_content(
-        prompt,
-        generation_config=GenerationConfig(temperature=0.1, max_output_tokens=4096),
-    )
-    text = (r.text or "").strip()
-    if not text:
-        raise RuntimeError("Vertex model returned empty text.")
+    text = _generate_raw_llm_text(question, table_ref, window_start, window_end, window_note)
     sql = _extract_sql_from_model_text(text)
     return _validate_llm_sql(sql, table_ref, window_start, window_end)
 

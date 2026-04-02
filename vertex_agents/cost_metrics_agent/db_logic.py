@@ -68,15 +68,35 @@ def _month_bounds(year: int, month: int) -> tuple[date, date]:
 
 
 def _mentions_prod(q: str) -> bool:
-    return bool(re.search(r"\b(prod|production|prd)\b", q, re.I))
+    return bool(re.search(r"(?<![-])\b(prod|production|prd)\b", q, re.I))
 
 
 def _mentions_dev(q: str) -> bool:
-    return bool(re.search(r"\b(dev|development)\b", q, re.I))
+    return bool(re.search(r"(?<![-])\b(dev|development)\b", q, re.I))
+
+
+def _dev_mention_is_project_slug(q: str) -> bool:
+    return bool(re.search(r"[a-z0-9][a-z0-9-]*\s*-\s*dev\s+project", q, re.I))
 
 
 def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date | None, date | None, list[str]]:
     notes: list[str] = []
+
+    m_days = re.search(
+        r"\b(?:(?:over|in|during|for)\s+the\s+)?(?:last|past)\s+(\d{1,2})\s+days?\b",
+        q_lower,
+    )
+    if m_days:
+        n = min(max(int(m_days.group(1)), 1), 366)
+        end = today
+        start = today - timedelta(days=n - 1)
+        notes.append(f"last {n} days ({start} to {end})")
+        return start, end, notes
+
+    if re.search(r"\byesterday\b", q_lower):
+        y = today - timedelta(days=1)
+        notes.append(f"yesterday ({y})")
+        return y, y, notes
 
     m = re.search(
         r"(?:for\s+)?(?:the\s+)?(?:entire\s+month\s+of\s+)?"
@@ -110,6 +130,11 @@ def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date |
         notes.append(f"last calendar week ({start_last} to {end_last})")
         return start_last, end_last, notes
 
+    if re.search(r"\bthis\s+week\b", q_lower):
+        start_this_week = today - timedelta(days=today.weekday())
+        notes.append("this week (week-to-date)")
+        return start_this_week, today, notes
+
     date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", question)
     if date_match:
         d = date.fromisoformat(date_match.group(1))
@@ -119,10 +144,40 @@ def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date |
     return None, None, notes
 
 
+def _looks_like_gcp_region(token: str) -> bool:
+    sl = token.lower().strip()
+    if not sl or len(sl) > 32:
+        return False
+    return bool(re.match(r"^[a-z]{2,}-[a-z0-9-]+\d$", sl)) or bool(
+        re.match(r"^[a-z]{2,}-[a-z0-9]+-[a-z0-9]+\d$", sl)
+    )
+
+
+def _extract_billing_region(question: str) -> str | None:
+    q = (
+        question.strip()
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+    )
+    patterns = (
+        r"(?i)['\"]([a-z0-9-]+)['\"]\s+region\b",
+        r"(?i)\bin\s+the\s+['\"]([a-z0-9-]+)['\"]\s+region\b",
+        r"(?i)\bregion\s+['\"]([a-z0-9-]+)['\"]",
+    )
+    for p in patterns:
+        m = re.search(p, q)
+        if m and _looks_like_gcp_region(m.group(1)):
+            return m.group(1).lower()
+    return None
+
+
 @dataclass(frozen=True)
 class CostQueryFilters:
     env: str | None
     svc: str | None
+    billing_region: str | None
     period_start: date | None
     period_end: date | None
     wants_total: bool
@@ -148,7 +203,7 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     elif _mentions_prod(q):
         env = "prod"
         notes.append("filtering environment=prod")
-    elif _mentions_dev(q):
+    elif _mentions_dev(q) and not _dev_mention_is_project_slug(question):
         env = "dev"
         notes.append("filtering environment=dev")
 
@@ -164,13 +219,30 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     ps, pe, pnotes = _parse_time_period(question, q, ref)
     notes.extend(pnotes)
 
-    wants_total = bool(re.search(r"\b(total|sum|aggregate)\b", q))
+    br = _extract_billing_region(question)
+    if br:
+        notes.append(f"filtering location.region={br}")
+
+    breakdown = bool(
+        re.search(
+            r"\b(breakdown|broken down|by\s+gcp\s+project|by\s+project|per\s+project|each\s+project)\b",
+            q,
+        )
+    )
+    wants_total = (
+        bool(re.search(r"\b(total|sum|aggregate)\b", q))
+        or (
+            bool(re.search(r"\bhow\s+much\b", q))
+            and bool(re.search(r"\b(spend|cost|pay|paid)\b", q))
+        )
+    ) and not breakdown
     wants_top = bool(re.search(r"\b(top|highest|largest|biggest|most\s+expensive)\b", q))
 
     hint = "; ".join(notes) if notes else "no explicit filters, using full available data"
     return CostQueryFilters(
         env=env,
         svc=svc,
+        billing_region=br,
         period_start=ps,
         period_end=pe,
         wants_total=wants_total,
@@ -286,6 +358,13 @@ def _query_bigquery(question: str) -> str:
             "STRPOS(LOWER(IFNULL(service.description, '')), LOWER(@service_needle)) > 0"
         )
         params.append(bigquery.ScalarQueryParameter("service_needle", "STRING", f.svc))
+    if f.billing_region:
+        filters.append(
+            "LOWER(TRIM(COALESCE(location.region, ''))) = LOWER(@billing_region)"
+        )
+        params.append(
+            bigquery.ScalarQueryParameter("billing_region", "STRING", f.billing_region)
+        )
     if f.has_period:
         filters.append("DATE(usage_start_time) BETWEEN @period_start AND @period_end")
         params.append(

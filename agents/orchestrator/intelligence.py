@@ -192,8 +192,8 @@ _METRICS_LOCAL = re.compile(
     r"gcp|google\s+cloud|aws|azure|bigquery|big\s+query|storage|compute|kubernetes|gke|"
     r"cloud\s+run|sql|postgres|postgresql|database|environment|env\b|prod|production|"
     r"staging|dev\b|development|metric|metrics|trend|trends|spike|spikes|anomal|"
-    r"yesterday|last\s+week|last\s+month|this\s+month|quarter|service|services|"
-    r"resource|resources|sku|line\s+item|export|table\s+cloud_costs)\b",
+    r"yesterday|last\s+week|last\s+month|this\s+week|this\s+month|quarter|service|services|"
+    r"resource|resources|skus?|line\s+item|export|table\s+cloud_costs|project)\b",
     re.I,
 )
 
@@ -281,7 +281,8 @@ async def classify_intent_haiku(
         "(e.g. weather, recipes, politics, sports, general knowledge, coding homework, creative writing). "
         "Reply for out_of_scope must politely say you only help with cloud cost and usage questions. "
         "Use intent=metrics for anything needing database cost/usage numbers, trends, spikes, budgets, "
-        "services, environments, GCP/AWS/Azure spend, or multi-step reasoning over metrics."
+        "services, environments, GCP/AWS/Azure spend, SKU or line-item questions, queries that name a "
+        "GCP project id (e.g. my-app-prod or org-training-486405), or multi-step reasoning over metrics."
     )
     user_prompt = f"Conversation context:\n{ctx_lines}\n\nLatest user message:\n{latest_user_message}"
     text = await call_claude(

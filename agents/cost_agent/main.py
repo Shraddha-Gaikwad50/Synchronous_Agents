@@ -26,7 +26,13 @@ from pydantic import BaseModel, Field
 
 from telemetry import setup_observability
 
-from billing_llm_sql import question_needs_llm_sql, run_llm_billing_query, vertex_available
+from billing_llm_sql import (
+    google_ai_configured,
+    llm_sql_usable,
+    question_needs_llm_sql,
+    run_llm_billing_query,
+    vertex_available,
+)
 
 # Optional: ADK agent shell for future tool wiring (no HTTP coupling)
 try:
@@ -106,6 +112,22 @@ def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date |
     """Inclusive date range from natural language; also handles YYYY-MM-DD."""
     notes: list[str] = []
 
+    m_days = re.search(
+        r"\b(?:(?:over|in|during|for)\s+the\s+)?(?:last|past)\s+(\d{1,2})\s+days?\b",
+        q_lower,
+    )
+    if m_days:
+        n = min(max(int(m_days.group(1)), 1), 366)
+        end = today
+        start = today - timedelta(days=n - 1)
+        notes.append(f"last {n} days ({start} to {end})")
+        return start, end, notes
+
+    if re.search(r"\byesterday\b", q_lower):
+        y = today - timedelta(days=1)
+        notes.append(f"yesterday ({y})")
+        return y, y, notes
+
     m = re.search(
         r"(?:for\s+)?(?:the\s+)?(?:entire\s+month\s+of\s+)?"
         r"(january|february|march|april|may|june|july|august|september|october|november|december|"
@@ -156,6 +178,7 @@ def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date |
 class CostQueryFilters:
     env: str | None
     svc: str | None
+    billing_region: str | None
     period_start: date | None
     period_end: date | None
     wants_total: bool
@@ -168,11 +191,262 @@ class CostQueryFilters:
 
 
 def _mentions_prod(q: str) -> bool:
-    return bool(re.search(r"\b(prod|production|prd)\b", q, re.I))
+    # Avoid matching "prod" inside project slugs like "my-prod-app" (hyphen before token).
+    return bool(re.search(r"(?<![-])\b(prod|production|prd)\b", q, re.I))
 
 
 def _mentions_dev(q: str) -> bool:
-    return bool(re.search(r"\b(dev|development)\b", q, re.I))
+    # Avoid matching "dev" inside "jaybel-dev" (hyphen before token).
+    return bool(re.search(r"(?<![-])\b(dev|development)\b", q, re.I))
+
+
+def _dev_mention_is_project_slug(q: str) -> bool:
+    """e.g. 'jaybel- dev project' — the word dev is part of a project id, not environment=dev."""
+    return bool(re.search(r"[a-z0-9][a-z0-9-]*\s*-\s*dev\s+project", q, re.I))
+
+
+def _normalize_project_id_slug(raw: str) -> str:
+    return re.sub(r"\s+", "", raw.strip().lower())
+
+
+def _looks_like_gcp_region(token: str) -> bool:
+    sl = token.lower().strip()
+    if not sl or len(sl) > 32:
+        return False
+    return bool(re.match(r"^[a-z]{2,}-[a-z0-9-]+\d$", sl)) or bool(
+        re.match(r"^[a-z]{2,}-[a-z0-9]+-[a-z0-9]+\d$", sl)
+    )
+
+
+def _extract_billing_region(question: str) -> str | None:
+    """location.region value, e.g. asia-south1 from 'asia-south1' region."""
+    q = (
+        question.strip()
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+    )
+    patterns = (
+        r"(?i)['\"]([a-z0-9-]+)['\"]\s+region\b",
+        r"(?i)\bin\s+the\s+['\"]([a-z0-9-]+)['\"]\s+region\b",
+        r"(?i)\bregion\s+['\"]([a-z0-9-]+)['\"]",
+    )
+    for p in patterns:
+        m = re.search(p, q)
+        if m and _looks_like_gcp_region(m.group(1)):
+            return m.group(1).lower()
+    return None
+
+
+def _extract_gcp_project_id(question: str) -> str | None:
+    """Billing export project.id (e.g. jaybel-dev), not necessarily GCP project number."""
+    ql = question.strip()
+    # Hyphenated ids with optional spaces around hyphens: "jaybel- dev project", "gls-training-486405 project"
+    m_slug = re.search(
+        r"(?i)\b([a-z][a-z0-9]*(?:\s*-\s*[a-z0-9]+)+)\s+project\b",
+        ql,
+    )
+    if m_slug:
+        return _normalize_project_id_slug(m_slug.group(1))
+    patterns = (
+        r"(?i)in\s+the\s+([a-z][a-z0-9-]{1,62})\s+project\b",
+        r"(?i)\bproject\s+([a-z][a-z0-9-]{1,62})\b",
+        r"(?i)\b([a-z][a-z0-9-]{1,62})\s+project\b",
+    )
+    for p in patterns:
+        m = re.search(p, ql)
+        if m:
+            return _normalize_project_id_slug(m.group(1))
+    return None
+
+
+def _sku_rank_template_eligible(question: str, f: CostQueryFilters) -> bool:
+    return bool(
+        re.search(r"\bskus?\b", question, re.I)
+        and _extract_gcp_project_id(question)
+        and f.has_period
+    )
+
+
+def _try_sku_top_by_project_json(
+    question: str,
+    f: CostQueryFilters,
+    table_ref: str,
+    table_project: str,
+) -> str | None:
+    """Fast template: top N SKUs by cost for one project.id over parsed date range (no env label filter)."""
+    if not re.search(r"\bskus?\b", question, re.I):
+        return None
+    pid = _extract_gcp_project_id(question)
+    if not pid or not f.has_period or f.period_start is None or f.period_end is None:
+        return None
+    m = re.search(r"\btop\s+(\d+)\b", question, re.I)
+    top_n = int(m.group(1)) if m else 5
+    top_n = min(max(top_n, 1), 40)
+
+    sql = f"""
+    SELECT
+      sku.description AS sku_description,
+      ANY_VALUE(service.description) AS service_name,
+      ANY_VALUE(project.id) AS project_id,
+      SUM(cost) AS cost_inr
+    FROM `{table_ref}`
+    WHERE DATE(usage_start_time) BETWEEN @period_start AND @period_end
+      AND project.id = @project_id
+    GROUP BY sku.description
+    ORDER BY cost_inr DESC
+    LIMIT @top_limit
+    """
+    params = [
+        bigquery.ScalarQueryParameter("period_start", "DATE", f.period_start.isoformat()),
+        bigquery.ScalarQueryParameter("period_end", "DATE", f.period_end.isoformat()),
+        bigquery.ScalarQueryParameter("project_id", "STRING", pid),
+        bigquery.ScalarQueryParameter("top_limit", "INT64", top_n),
+    ]
+    client = bigquery.Client(project=table_project)
+    rows = list(
+        client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result()
+    )
+    out: list[dict[str, str]] = []
+    for row in rows:
+        out.append(
+            {
+                "sku_description": str(row["sku_description"] or ""),
+                "service_name": str(row["service_name"] or ""),
+                "project_id": str(row["project_id"] or ""),
+                "cost_inr": str(row["cost_inr"]),
+                "currency": "INR",
+            }
+        )
+    return json.dumps(out, indent=2)
+
+
+def _spend_by_project_template_eligible(question: str, f: CostQueryFilters) -> bool:
+    if not f.has_period:
+        return False
+    ql = question.lower()
+    if not (
+        re.search(r"\b(breakdown|broken down)\b", ql)
+        or re.search(r"\bby\s+gcp\s+project\b", ql)
+        or re.search(r"\b(per|each)\s+project\b", ql)
+        or re.search(r"\bby\s+project\b", ql)
+    ):
+        return False
+    return bool(
+        re.search(r"\b(spend|cost|billing|charged|amount|total|inr|money)\b", ql)
+    )
+
+
+def _try_spend_by_project_json(
+    question: str,
+    f: CostQueryFilters,
+    table_ref: str,
+    table_project: str,
+) -> str | None:
+    """Aggregate cost by billing project.id over the parsed window (no env label filter)."""
+    if not _spend_by_project_template_eligible(question, f):
+        return None
+    if not f.has_period or f.period_start is None or f.period_end is None:
+        return None
+    sql = f"""
+    SELECT
+      project.id AS project_id,
+      SUM(cost) AS cost_inr
+    FROM `{table_ref}`
+    WHERE DATE(usage_start_time) BETWEEN @period_start AND @period_end
+    GROUP BY project.id
+    ORDER BY cost_inr DESC
+    LIMIT 100
+    """
+    params = [
+        bigquery.ScalarQueryParameter("period_start", "DATE", f.period_start.isoformat()),
+        bigquery.ScalarQueryParameter("period_end", "DATE", f.period_end.isoformat()),
+    ]
+    client = bigquery.Client(project=table_project)
+    rows = list(
+        client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result()
+    )
+    out: list[dict[str, str]] = []
+    for row in rows:
+        out.append(
+            {
+                "project_id": str(row["project_id"] or ""),
+                "cost_inr": str(row["cost_inr"]),
+                "currency": "INR",
+            }
+        )
+    return json.dumps(out, indent=2)
+
+
+def _regions_cost_template_eligible(question: str, f: CostQueryFilters) -> bool:
+    """Cost grouped by location.region (no LLM)."""
+    if not f.has_period:
+        return False
+    ql = question.lower()
+    if not re.search(
+        r"\b(regions|availability\s+zones?|data\s+centers?|geographic)\b",
+        ql,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(cost|spend|money|expensive|most|highest|paid|bill|price)\b",
+            ql,
+        )
+    )
+
+
+def _try_regions_cost_json(
+    question: str,
+    f: CostQueryFilters,
+    table_ref: str,
+    table_project: str,
+) -> str | None:
+    if not _regions_cost_template_eligible(question, f):
+        return None
+    if not f.has_period or f.period_start is None or f.period_end is None:
+        return None
+    sql = f"""
+    SELECT
+      COALESCE(
+        NULLIF(TRIM(COALESCE(location.region, '')), ''),
+        '(unset / global)'
+      ) AS region,
+      SUM(cost) AS cost_inr
+    FROM `{table_ref}`
+    WHERE DATE(usage_start_time) BETWEEN @period_start AND @period_end
+    GROUP BY region
+    ORDER BY cost_inr DESC
+    LIMIT 30
+    """
+    params = [
+        bigquery.ScalarQueryParameter("period_start", "DATE", f.period_start.isoformat()),
+        bigquery.ScalarQueryParameter("period_end", "DATE", f.period_end.isoformat()),
+    ]
+    client = bigquery.Client(project=table_project)
+    rows = list(
+        client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=params),
+        ).result()
+    )
+    out: list[dict[str, str]] = []
+    for row in rows:
+        out.append(
+            {
+                "region": str(row["region"] or ""),
+                "cost_inr": str(row["cost_inr"]),
+                "currency": "INR",
+            }
+        )
+    return json.dumps(out, indent=2)
 
 
 def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFilters:
@@ -190,7 +464,7 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     elif _mentions_prod(q):
         env = "prod"
         notes.append("filtering environment=prod")
-    elif _mentions_dev(q):
+    elif _mentions_dev(q) and not _dev_mention_is_project_slug(question):
         env = "dev"
         notes.append("filtering environment=dev")
 
@@ -206,19 +480,58 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     ps, pe, pnotes = _parse_time_period(question, q, ref)
     notes.extend(pnotes)
 
-    wants_total = bool(re.search(r"\b(total|sum|aggregate)\b", q))
+    br = _extract_billing_region(question)
+    if br:
+        notes.append(f"filtering location.region={br}")
+
+    breakdown = bool(
+        re.search(
+            r"\b(breakdown|broken down|by\s+gcp\s+project|by\s+project|per\s+project|each\s+project)\b",
+            q,
+        )
+    )
+    wants_total = (
+        bool(re.search(r"\b(total|sum|aggregate)\b", q))
+        or (
+            bool(re.search(r"\bhow\s+much\b", q))
+            and bool(re.search(r"\b(spend|cost|pay|paid)\b", q))
+        )
+    ) and not breakdown
     wants_top = bool(re.search(r"\b(top|highest|largest|biggest|most\s+expensive)\b", q))
 
     hint = "; ".join(notes) if notes else "no explicit filters"
     return CostQueryFilters(
         env=env,
         svc=svc,
+        billing_region=br,
         period_start=ps,
         period_end=pe,
         wants_total=wants_total,
         wants_top=wants_top,
         hint=hint,
     )
+
+
+def _skip_billing_llm_sql(question: str, f: CostQueryFilters) -> bool:
+    """Answer with parameterized BigQuery (query_bigquery) — no generated SQL / Vertex predict."""
+    if not f.has_period or f.period_start is None or f.period_end is None:
+        return False
+    ql = question.lower()
+    if any(
+        re.search(p, ql)
+        for p in (
+            r"\bcredits?\b",
+            r"\bpromotional\b",
+            r"\bpromo\b",
+            r"\bcommitment\b",
+            r"\breservation\b",
+            r"\bsustained use\b",
+        )
+    ):
+        return False
+    if re.search(r"\bskus?\b", ql) and not _extract_gcp_project_id(question):
+        return False
+    return bool(f.svc or f.billing_region or f.env)
 
 
 def compute_llm_date_window(f: CostQueryFilters, today: date) -> tuple[date, date, str]:
@@ -346,6 +659,16 @@ def query_bigquery(question: str) -> str:
     if not table_project:
         raise RuntimeError("Set BQ_BILLING_PROJECT or GOOGLE_CLOUD_PROJECT for BigQuery queries.")
     table_ref = f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
+    sku_early = _try_sku_top_by_project_json(question, f, table_ref, table_project)
+    if sku_early is not None:
+        return sku_early
+    spend_early = _try_spend_by_project_json(question, f, table_ref, table_project)
+    if spend_early is not None:
+        return spend_early
+    regions_early = _try_regions_cost_json(question, f, table_ref, table_project)
+    if regions_early is not None:
+        return regions_early
+
     filters: list[str] = []
     params: list[bigquery.ScalarQueryParameter] = []
     if f.svc:
@@ -353,6 +676,13 @@ def query_bigquery(question: str) -> str:
             "STRPOS(LOWER(IFNULL(service.description, '')), LOWER(@service_needle)) > 0"
         )
         params.append(bigquery.ScalarQueryParameter("service_needle", "STRING", f.svc))
+    if f.billing_region:
+        filters.append(
+            "LOWER(TRIM(COALESCE(location.region, ''))) = LOWER(@billing_region)"
+        )
+        params.append(
+            bigquery.ScalarQueryParameter("billing_region", "STRING", f.billing_region)
+        )
     if f.has_period:
         filters.append("DATE(usage_start_time) BETWEEN @period_start AND @period_end")
         params.append(
@@ -446,12 +776,34 @@ def query_cost_data(question: str) -> tuple[str, str]:
     table_project = BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     llm_on = os.environ.get("BILLING_AGENT_LLM_SQL", "1").lower() not in ("0", "false", "no")
 
+    if mode in {"auto", "bigquery"} and _bigquery_ready() and table_project:
+        table_ref = f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
+        sku_fast = _try_sku_top_by_project_json(question, f, table_ref, table_project)
+        if sku_fast is not None:
+            return (
+                sku_fast,
+                f"{hint}; source=bigquery; template=sku_by_project; currency=INR",
+            )
+        spend_fast = _try_spend_by_project_json(question, f, table_ref, table_project)
+        if spend_fast is not None:
+            return (
+                spend_fast,
+                f"{hint}; source=bigquery; template=spend_by_project; currency=INR",
+            )
+        regions_fast = _try_regions_cost_json(question, f, table_ref, table_project)
+        if regions_fast is not None:
+            return (
+                regions_fast,
+                f"{hint}; source=bigquery; template=cost_by_region; currency=INR",
+            )
+
     if (
         mode in {"auto", "bigquery"}
         and _bigquery_ready()
         and table_project
         and llm_on
         and question_needs_llm_sql(question)
+        and not _skip_billing_llm_sql(question, f)
     ):
         table_ref = f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
         ws, we, wnote = compute_llm_date_window(f, date.today())
@@ -528,7 +880,14 @@ async def task_stream(message: str, task_id: str) -> AsyncIterator[str]:
     f = parse_cost_query(message)
     progress_hint = f.hint
     llm_on = os.environ.get("BILLING_AGENT_LLM_SQL", "1").lower() not in ("0", "false", "no")
-    use_llm = llm_on and question_needs_llm_sql(message)
+    use_llm = (
+        llm_on
+        and question_needs_llm_sql(message)
+        and not _skip_billing_llm_sql(message, f)
+        and not _sku_rank_template_eligible(message, f)
+        and not _spend_by_project_template_eligible(message, f)
+        and not _regions_cost_template_eligible(message, f)
+    )
     yield sse_pack(
         {
             "id": task_id,
@@ -543,11 +902,16 @@ async def task_stream(message: str, task_id: str) -> AsyncIterator[str]:
     )
     await asyncio.sleep(0.05)
 
-    run_msg = (
-        "Running guarded analytics (Vertex → BigQuery, dry-run byte cap)…"
-        if use_llm
-        else f"Running query ({progress_hint})…"
-    )
+    if _sku_rank_template_eligible(message, f):
+        run_msg = "Running fast template (top SKUs by project and date range)…"
+    elif _spend_by_project_template_eligible(message, f):
+        run_msg = "Running fast template (spend by GCP project for date range)…"
+    elif _regions_cost_template_eligible(message, f):
+        run_msg = "Running fast template (cost by GCP region for date range)…"
+    elif use_llm:
+        run_msg = "Running guarded analytics (Vertex / Google AI → BigQuery, dry-run byte cap)…"
+    else:
+        run_msg = f"Running query ({progress_hint})…"
     yield sse_pack(
         {
             "id": task_id,
@@ -645,6 +1009,8 @@ async def health():
             os.environ.get("BILLING_AGENT_LLM_SQL", "1").lower() not in ("0", "false", "no")
         ),
         "vertex_generative_available": vertex_available(),
+        "google_ai_api_configured": google_ai_configured(),
+        "llm_sql_usable": llm_sql_usable(),
     }
 
 
